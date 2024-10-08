@@ -7,6 +7,8 @@
 
 #include "ggml-alloc.h"
 
+#include "swapper.h"
+
 #ifdef GGML_USE_CUBLAS
 #  include "ggml-cuda.h"
 #elif defined(GGML_USE_CLBLAST)
@@ -1908,6 +1910,7 @@ struct llama_model_loader {
 
         // determine file type based on the number of tensors for each quantization and print meta data
         // TODO: make optional
+        /*
         {
             std::map<enum ggml_type, uint32_t> n_type;
 
@@ -1974,6 +1977,7 @@ struct llama_model_loader {
                 LLAMA_LOG_INFO("%s: - type %4s: %4d tensors\n", __func__, ggml_type_name(kv.first), kv.second);
             }
         }
+        */
 
         if (!llama_mmap::SUPPORTED) {
             LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
@@ -2025,6 +2029,37 @@ struct llama_model_loader {
             (use_mmap ? mmapped_size_p : ctx_size_p) += ggml_nbytes_pad(meta);
         }
     }
+
+    // calculate sizes (including context for swappable weights)
+    void calc_sizes(size_t &ctx_size, size_t &mmapped_size, size_t &ctx_swap_size, size_t &ctx_swap_max_size) const {
+        ctx_size = ctx_swap_size = ctx_swap_max_size = 0;
+        mmapped_size = 0;
+
+        constexpr size_t tensor_meta_size = sizeof(struct ggml_tensor) + GGML_OBJECT_SIZE;
+
+        for (int i = 0; i < n_tensors; i++) {
+            struct ggml_tensor * meta = get_tensor_meta(i);
+            bool swap = is_swap_target_tensor(meta);
+
+            if (swap) {
+                ctx_swap_size += tensor_meta_size;
+                ctx_swap_max_size += tensor_meta_size;
+            } else {
+                ctx_size += tensor_meta_size;
+            }
+
+            if (use_mmap)
+                mmapped_size += ggml_nbytes_pad(meta);
+            else {
+                if (swap) {
+                    // don't count tensor data size in ctx_swap_size
+                    ctx_swap_max_size += ggml_nbytes_pad(meta);
+                } else {
+                    ctx_size += ggml_nbytes_pad(meta);
+                }             
+            }
+        }
+    } 
 
     struct ggml_tensor * create_tensor_for(struct ggml_context * ctx, struct ggml_tensor * meta, ggml_backend_type backend) {
         if (backend != GGML_BACKEND_CPU) {
@@ -2109,6 +2144,8 @@ struct llama_model_loader {
         }
     }
 
+
+    // NOTE: not all tensors belong to this context after introducing swappable weights
     void load_all_data(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock) {
         size_t size_data = 0;
         size_t size_lock = 0;
@@ -2116,6 +2153,9 @@ struct llama_model_loader {
 
         for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
             struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
+            if (!cur)
+                continue;
+
             size_data += ggml_nbytes(cur);
             if (cur->backend == GGML_BACKEND_CPU) {
                 size_pref += ggml_nbytes(cur);
@@ -2132,7 +2172,9 @@ struct llama_model_loader {
         size_t done_size = 0;
         for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
             struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
-            GGML_ASSERT(cur); // unused tensors should have been caught by load_data already
+            // GGML_ASSERT(cur); // unused tensors should have been caught by load_data already
+            if (!cur)
+                continue;
 
             if (progress_callback) {
                 progress_callback((float) done_size / size_data, progress_callback_user_data);
@@ -3358,10 +3400,43 @@ static void llm_load_tensors(
 
     size_t ctx_size;
     size_t mmapped_size;
+    size_t ctx_swap_size = 0, ctx_swap_max_size = 0;
+    bool swap_on = !ml.use_mmap;
 
-    ml.calc_sizes(ctx_size, mmapped_size);
+    if (swap_on) {
+        // calculate sizes for all contexts
+        ml.calc_sizes(ctx_size, mmapped_size, ctx_swap_size, ctx_swap_max_size);
+        LLAMA_LOG_INFO("%s: ggml ctx size = %.2f MiB, swappable ctx size = %.2f MiB, mmapped size = %.2f MiB\n",
+            __func__, ctx_size/1048576.0, ctx_swap_size/1048576.0, mmapped_size/1048576.0);
+    } else {
+        ml.calc_sizes(ctx_size, mmapped_size);
 
-    LLAMA_LOG_INFO("%s: ggml ctx size = %7.2f MB\n", __func__, ctx_size/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: ggml ctx size = %7.2f MB\n", __func__, ctx_size/1024.0/1024.0);
+    }
+
+    Swapper *swapper = nullptr;
+    if (swap_on) {
+        auto swap_size_env_var = getenv("LLAMA_SWAP_SIZE_MB");
+        float swap_size_mb;
+        bool swap_size_ok = true;
+        if (!swap_size_env_var)
+            swap_size_ok = false;
+        else {
+            try {
+                swap_size_mb = std::atof(swap_size_env_var);
+            } catch (...) {
+                swap_size_ok = false;
+            }
+        }
+        if (!swap_size_ok) {
+            LLAMA_LOG_INFO("swapper: env var LLAMA_SWAP_SIZE_MB not set or invalid. using default size %.2f MiB (swap off)\n"
+                , ctx_swap_max_size / 1048576.0);
+        }
+    
+        size_t swap_area_size = swap_size_ok ? swap_size_mb * 1048576 : ctx_swap_max_size;
+        swapper = new Swapper;
+        swapper->init(swap_area_size, fileno(ml.file.fp));
+    }
 
     // create the ggml context
     {
@@ -3381,6 +3456,20 @@ static void llm_load_tensors(
         if (!model.ctx) {
             throw std::runtime_error(format("ggml_init() failed"));
         }
+    }
+
+    // hzx: create context for swappable weights
+    ggml_context *ctx_swap = nullptr;
+    if (swap_on) {
+        // NOTE: set no_alloc to avoid allocating memory for tensor data
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ctx_swap_size,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        ctx_swap = ggml_init(params);
+        GGML_ASSERT(ctx_swap);
     }
 
     (void) main_gpu;
@@ -3455,6 +3544,10 @@ static void llm_load_tensors(
 
                     model.layers.resize(n_layer);
 
+                    auto mark_swappable_tensor = [swapper, &ml](ggml_tensor *x) {
+                        swapper->add_tensor_ordered(x, ml.file_offset(ggml_get_name(x)));
+                    };
+
                     for (uint32_t i = 0; i < n_layer; ++i) {
                         const ggml_backend_type backend = int(i) < i_gpu_start ? GGML_BACKEND_CPU : llama_backend_offload; // NOLINT
                         const ggml_backend_type backend_split = int(i) < i_gpu_start ? GGML_BACKEND_CPU : llama_backend_offload_split; // NOLINT
@@ -3471,8 +3564,20 @@ static void llm_load_tensors(
                         layer.ffn_norm = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, backend);
 
                         layer.ffn_gate = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, backend_split);
-                        layer.ffn_down = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, backend_split);
-                        layer.ffn_up   = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, backend_split);
+                        
+                        if (!swap_on) {
+                            layer.ffn_down = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, backend_split);
+                            layer.ffn_up   = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, backend_split);
+                        } else {
+                            // hzx: use dedicated context for ffn_up & ffn_down
+                            // TODO: make this process automated
+                            layer.ffn_down = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, backend_split);
+                            layer.ffn_up   = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, backend_split);
+
+                            // NOTE: these calls are ordered. swapper is also attached to these tensors
+                            mark_swappable_tensor(layer.ffn_up);
+                            mark_swappable_tensor(layer.ffn_down);
+                        }
 
                         if (backend == GGML_BACKEND_GPU) {
                             vram_weights +=
@@ -4009,9 +4114,10 @@ static void llm_load_tensors(
         // this is the total memory required to run the inference
         size_t mem_required =
             ctx_size +
+            ctx_swap_size +
             mmapped_size - vram_weights; // weights in VRAM not in memory
 
-        LLAMA_LOG_INFO("%s: mem required  = %7.2f MB\n", __func__, mem_required / 1024.0 / 1024.0);
+        LLAMA_LOG_INFO("%s: mem required  = %7.2f MB (not including swap area)\n", __func__, mem_required / 1024.0 / 1024.0);
 
 #if defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST)
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
@@ -4038,7 +4144,9 @@ static void llm_load_tensors(
 
     // populate `tensors_by_name`
     for (int i = 0; i < ml.n_tensors; ++i) {
-        struct ggml_tensor * cur = ggml_get_tensor(ctx, ml.get_tensor_name(i));
+        auto name = ml.get_tensor_name(i);
+        auto ctx_ = (swap_on && is_swap_target_tensor(name)) ? ctx_swap : ctx;
+        struct ggml_tensor * cur = ggml_get_tensor(ctx_, ml.get_tensor_name(i));
         model.tensors_by_name.emplace_back(ggml_get_name(cur), cur);
     }
 
@@ -4050,6 +4158,9 @@ static void llm_load_tensors(
 #endif
 
     ml.load_all_data(ctx, progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL);
+    
+    if (swap_on)
+        swapper->load_initial_tensors();
 
     if (progress_callback) {
         progress_callback(1.0f, progress_callback_user_data);

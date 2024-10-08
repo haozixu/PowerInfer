@@ -24,6 +24,8 @@
 #include <stdarg.h>
 #include <signal.h>
 
+#include "swapper.h"
+
 // #define _GNU_SOURCE
 // #include <sched.h>
 
@@ -16854,6 +16856,17 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     return n_tasks;
 }
 
+static void free_swappable_tensor_sources(struct ggml_tensor *x) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        struct ggml_tensor *src = x->src[i];
+        if (!src || !is_swap_enabled_tensor(src)) {
+            continue;
+        }
+
+        free_swap_enabled_tensor(src);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -16891,6 +16904,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     ggml_compute_forward(&params, node);
                 }
                 ggml_graph_compute_perf_stats_node(node, state->shared);
+
+                free_swappable_tensor_sources(node);
             }
 
             // distribute new work or execute it direct if 1T
@@ -16899,6 +16914,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
                 struct ggml_tensor * node = cgraph->nodes[node_n];
                 const int n_tasks = ggml_get_n_tasks(node, n_threads);
+
+                // check for swappable source tensors, wait until they are ready in memory
+                // TODO: record elapsed time here
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    struct ggml_tensor *src = node->src[i];
+                    if (!src || !is_swap_enabled_tensor(src)) {
+                        continue;
+                    }
+
+                    validate_swap_enabled_tensor(src);
+                }
 
                 state->shared->perf_node_start_cycles  = ggml_perf_cycles();
                 state->shared->perf_node_start_time_us = ggml_perf_time_us();
@@ -16923,6 +16949,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     }
 
                     ggml_graph_compute_perf_stats_node(node, state->shared);
+
+                    free_swappable_tensor_sources(node);
                 } else {
                     break;
                 }
