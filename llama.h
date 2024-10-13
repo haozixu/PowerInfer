@@ -253,6 +253,7 @@ extern "C" {
         double t_sample_ms;
         double t_p_eval_ms;
         double t_eval_ms;
+        double t_swap_load_ms;
 
         int32_t n_sample;
         int32_t n_p_eval;

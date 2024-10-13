@@ -599,6 +599,9 @@ extern "C" {
         int     perf_runs;
         int64_t perf_cycles;
         int64_t perf_time_us;
+
+        // hzx: extra timing records here
+        int64_t swap_load_time_us;
     };
 
     // scratch buffer

@@ -1,4 +1,4 @@
-#include "swapper.h"
+#include "swapper.hh"
 
 extern "C" {
 

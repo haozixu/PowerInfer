@@ -24,7 +24,7 @@
 #include <stdarg.h>
 #include <signal.h>
 
-#include "swapper.h"
+#include "swapper.hh"
 
 // #define _GNU_SOURCE
 // #include <sched.h>
@@ -14051,6 +14051,7 @@ static void ggml_compute_forward_mul_mat_sparse(
     ggml_from_float_t const from_float_to_vec_dot = type_traits[vec_dot_type].from_float;
 
     const float threshold = sparse_pred_threshold;
+    GGML_ASSERT(threshold == 0.0);
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -14902,6 +14903,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 // we copy them back to CPU in advance to make sure tensor->data is valid.
                 ggml_ensure_tensor_data_at_memory(tensor->src[1]);
                 ggml_ensure_tensor_data_at_memory(tensor->src[2]);
+
+                // TODO(hzx): add controllable top-k gating here to tweak sparsity ratio
+                /*
+                struct ggml_tensor *pred = tensor->src[2];
+                float *pred_out = (float *) pred->data;
+                if (tensor->src[2]->ne[0] == 11008) {
+                    // printf("sss : %d %d\n", pred->ne[0], pred->ne[1]);
+                    for (int i = 0; i < 11008; ++i)
+                        pred_out[i] = i > 1651 ? -1 : 1; 
+                }
+                */
 
                 if (tensor->src[2]->ne[0] > 1000) {
                     ggml_compute_forward_mul_mat_sparse(params, tensor->src[0], tensor->src[1], tensor);
@@ -16375,6 +16387,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.perf_runs    =*/ 0,
         /*.perf_cycles  =*/ 0,
         /*.perf_time_us =*/ 0,
+        /*.swap_load_time_us=*/ 0,
     };
 
     return cgraph;
@@ -16401,6 +16414,7 @@ struct ggml_cgraph * ggml_graph_view(struct ggml_context * ctx, struct ggml_cgra
         /*.perf_runs    =*/ 0,
         /*.perf_cycles  =*/ 0,
         /*.perf_time_us =*/ 0,
+        /*.swap_load_time_us=*/ 0,
     };
 
     return cgraph;
@@ -16572,6 +16586,35 @@ static void clear_numa_thread_affinity(void) {
 
     CPU_FREE(cpus);
 }
+#elif defined(__ANDROID__)
+
+#include <sys/syscall.h>
+#include <sched.h>
+
+// hzx: hard-coded for Snapdragon 8+ gen 1 here
+static void set_numa_thread_affinity(int thread_n, int n_threads) {
+    (void) n_threads;
+    if (thread_n >= 8)
+        return;
+
+    int cpu_id = 7 - thread_n; // map thread 0 to the biggest cpu core
+    unsigned long cpu_mask = 1 << cpu_id;
+
+    const int max_retries = 3;
+    pid_t tid = gettid();
+    long rv;
+    for (int i = 0; i < max_retries; ++i) {
+        rv = syscall(__NR_sched_setaffinity, tid, sizeof(cpu_mask), &cpu_mask);
+        if (!rv)
+            break;
+    }
+
+    if (rv) {
+        fprintf(stderr, "sched_setaffinity failed: %s\n", strerror(errno));
+    }
+}
+
+static void clear_numa_thread_affinity(void) {}
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
@@ -16595,6 +16638,11 @@ struct ggml_compute_state_shared {
 
     bool (*abort_callback)(void * data); // abort ggml_graph_compute when true
     void * abort_callback_data;
+
+    // hzx: add state to record swappable tensor validation (loading) time
+    // NOTE: do we need atomic here?
+    int64_t n_swappable_tensors;
+    int64_t swap_load_time_us;
 };
 
 struct ggml_compute_state {
@@ -16917,14 +16965,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
                 // check for swappable source tensors, wait until they are ready in memory
                 // TODO: record elapsed time here
+                int64_t wait_time_us = 0;
                 for (int i = 0; i < GGML_MAX_SRC; ++i) {
                     struct ggml_tensor *src = node->src[i];
                     if (!src || !is_swap_enabled_tensor(src)) {
                         continue;
                     }
 
+                    int64_t t0 = ggml_time_us();
                     validate_swap_enabled_tensor(src);
+                    wait_time_us += ggml_time_us() - t0;
                 }
+                // if (wait_time_us > 0)
+                //     fprintf(stderr, "validate wait %zu us, node: %s\n", wait_time_us, ggml_get_name(node));
+                
+                // TODO: atomic needed?
+                state->shared->n_swappable_tensors++;
+                state->shared->swap_load_time_us += wait_time_us;
 
                 state->shared->perf_node_start_cycles  = ggml_perf_cycles();
                 state->shared->perf_node_start_time_us = ggml_perf_time_us();
@@ -16996,7 +17053,41 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         };
 
         if (state->ith < n_tasks) {
+            int64_t t1 = ggml_time_us();
             ggml_compute_forward(&params, node);
+            int64_t elapsed = ggml_time_us() - t1;
+            (void) elapsed;
+    
+            // if (state->ith == 0 && elapsed > 500) {
+            //     printf("compute node %s took %zu us, srcs:", node->name, elapsed);
+            //     for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            //         if (node->src[i]) {
+            //             printf(" %s", node->src[i]->name);
+            //         }
+            //     }
+            //     printf("\n");
+            // }
+
+
+            /*
+            if (state->ith == 0 && strstr(node->name, "mlp_pre_out") != NULL) {
+                printf("%s type: %s\n", node->name, ggml_type_name(node->type));
+                // printf("shape: %d %d %d %d\n", node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+
+                if (node->ne[1] == 1) {
+                    GGML_ASSERT(node->type == GGML_TYPE_F32);
+
+                    int nnz = 0;
+                    float *data = (float *) node->data;
+                    for (int i = 0; i < node->ne[0]; ++i) {
+                        if (data[i] > 0.0f)
+                            nnz++;
+                    }
+
+                    printf("nnz ratio = %.3f\n", (double) nnz / node->ne[0]);
+                }
+            }
+            */
         }
     }
 
@@ -17428,6 +17519,8 @@ int ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
         /*.node_n                  =*/ -1,
         /*.abort_callback          =*/ NULL,
         /*.abort_callback_data     =*/ NULL,
+        /*.n_swappable_tensors     =*/ 0,
+        /*.swap_load_time_us       =*/ 0,
     };
 #else
     struct ggml_compute_state_shared state_shared = {
@@ -17441,6 +17534,8 @@ int ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
         /*.node_n                  =*/ -1,
         /*.abort_callback          =*/ NULL,
         /*.abort_callback_data     =*/ NULL,
+        /*.n_swappable_tensors     =*/ 0,
+        /*.swap_load_time_us       =*/ 0,
     };
 #endif
     struct ggml_compute_state * workers = alloca(sizeof(struct ggml_compute_state)*n_threads);
@@ -17504,6 +17599,9 @@ int ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
                 (double) perf_time_us_cur     / 1000.0,
                 (double) cgraph->perf_time_us / 1000.0 / cgraph->perf_runs);
     }
+
+    // hzx: extra timings
+    cgraph->swap_load_time_us = state_shared.swap_load_time_us;
 
     return compute_status;
 }

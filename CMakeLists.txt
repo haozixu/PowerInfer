@@ -679,7 +679,7 @@ add_library(llama
             llama.cpp
             llama.h
             swapper.cc
-            swapper.h
+            swapper.hh
             )
 
 target_include_directories(llama PUBLIC .)

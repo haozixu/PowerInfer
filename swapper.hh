@@ -26,6 +26,7 @@ void free_swap_enabled_tensor(struct ggml_tensor *);
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 #include <string>
 #include <vector>
@@ -34,10 +35,12 @@ void free_swap_enabled_tensor(struct ggml_tensor *);
 #include <utility>
 #include <unordered_map>
 
+#include <fcntl.h>
+
 // hard-coded for now
 static inline bool is_swap_target_tensor(const char *name) {
     // assert(name != nullptr);
-    return strstr(name, "ffn_up") || strstr(name, "ffn_down");
+    return strstr(name, "ffn_gate") || strstr(name, "ffn_up") || strstr(name, "ffn_down") || strstr(name, "ffn_down_t");
 }
 
 static inline bool is_swap_target_tensor(const ggml_tensor *x) {
@@ -46,6 +49,10 @@ static inline bool is_swap_target_tensor(const ggml_tensor *x) {
 
 static inline size_t round_up(size_t x, size_t alignment) {
     return ((x + alignment - 1) / alignment) * alignment;
+}
+
+static inline size_t next_aligned_address(size_t ) {
+
 }
 
 // check if two intervals intersect
@@ -70,6 +77,7 @@ struct Swapper {
 
     uint64_t magic;
     int file_fd; // descriptor of the weights file, only support single file
+    bool defer_load;
 
     size_t buf_size; // total size of swappable area
     uint8_t *buffer;
@@ -85,17 +93,24 @@ struct Swapper {
     int next_load_idx;
     size_t next_buf_pos;
 
-    Swapper() : magic{SWAPPER_MAGIC}, file_fd{-1}, buf_size{0}, buffer{nullptr},
+    Swapper() : magic{SWAPPER_MAGIC}, file_fd{-1}, defer_load{false}, buf_size{0}, buffer{nullptr},
         next_load_idx{-1}, next_buf_pos(0) {}
     
     void init(size_t size, int fd) {
         buf_size = size;
         file_fd = dup(fd); // duplicate incoming fd here for longer life-time
+        // file_fd = open("/dev/block/dm-23", O_RDONLY | O_DIRECT);
+        GGML_ASSERT(file_fd != -1);
+
+        defer_load = getenv("LLAMA_SWAP_DEFER_LOAD") != nullptr; // if env var is non-NULL, defer async weight load
 
         int ret = posix_memalign((void **) &buffer, 4096, size);
         GGML_ASSERT(!ret);
 
         fprintf(stderr, "swapper: buffer size: %.2f MiB, addr: %p\n", size / 1048576.0, buffer);
+        if (defer_load) {
+            fprintf(stderr, "swapper: async weight load deferred\n");
+        }
     }
 
     ~Swapper() {
@@ -174,7 +189,8 @@ struct Swapper {
         int fd = file_fd;
 
         // TODO: direct file read
-        pending_reqs[x] = std::async(std::launch::async, [fd, dst, len, off]() -> void * {
+        auto launch_policy = defer_load ? std::launch::deferred : std::launch::async;
+        pending_reqs[x] = std::async(launch_policy, [fd, dst, len, off]() -> void * {
             ssize_t ret = pread(fd, dst, len, off);
             if (ret < 0) {
                 fprintf(stderr, "load weight failed: %s\n", strerror(errno));
