@@ -3215,7 +3215,7 @@ static void llm_load_sparse_model_tensors(
     
         size_t swap_area_size = swap_size_ok ? swap_size_mb * 1048576 : ctx_swap_max_size;
         swapper = new Swapper;
-        swapper->init(swap_area_size, fileno(ml.file.fp));
+        swapper->init(swap_area_size, fileno(ml.file.fp), true);
     }
 
     // create the ggml context
@@ -3302,8 +3302,8 @@ static void llm_load_sparse_model_tensors(
                     const uint32_t n_ff = hparams.n_ff;
                     model.layers.resize(n_layer);
 
-                    auto mark_swappable_tensor = [swapper, &ml](ggml_tensor *x) {
-                        swapper->add_tensor_ordered(x, ml.file_offset(ggml_get_name(x)));
+                    auto mark_swappable_tensor = [swapper, &ml](ggml_tensor *x, int layer_idx) {
+                        swapper->add_tensor_ordered(x, ml.file_offset(ggml_get_name(x)), layer_idx);
                     };
 
                     for (uint32_t &i = current_layer; i < n_layer; ++i) {
@@ -3336,9 +3336,9 @@ static void llm_load_sparse_model_tensors(
                             layer.ffn_up   = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, GGML_BACKEND_CPU);
 
                             // NOTE: these calls are ordered. swapper is also attached to these tensors
-                            mark_swappable_tensor(layer.ffn_gate);
-                            mark_swappable_tensor(layer.ffn_up);
-                            mark_swappable_tensor(layer.ffn_down_t);
+                            mark_swappable_tensor(layer.ffn_gate, i);
+                            mark_swappable_tensor(layer.ffn_up, i);
+                            mark_swappable_tensor(layer.ffn_down_t, i);
                         }
                     }
                 } break;

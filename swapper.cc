@@ -23,4 +23,8 @@ void free_swap_enabled_tensor(ggml_tensor *x) {
     swapper->free(x);
 }
 
+void collect_predictor_output(const struct ggml_tensor *pred_out, void *swapper) {
+    reinterpret_cast<Swapper *>(swapper)->add_predictor_output(pred_out);
+}
+
 }

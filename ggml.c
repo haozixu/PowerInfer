@@ -16926,6 +16926,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith, n_threads);
 
     int node_n = -1;
+    void *swapper = NULL; // we assume there's only one Swapper instance
 
     while (true) {
         if (cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
@@ -16970,6 +16971,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     struct ggml_tensor *src = node->src[i];
                     if (!src || !is_swap_enabled_tensor(src)) {
                         continue;
+                    }
+
+                    if (!swapper) {
+                        swapper = src->extra;
                     }
 
                     int64_t t0 = ggml_time_us();
@@ -17088,6 +17093,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 }
             }
             */
+
+            if (state->ith == 0 && strstr(node->name, "mlp_pre_out") != NULL) {
+                if (swapper) {
+                    collect_predictor_output(node, swapper);
+                }
+            }
         }
     }
 
