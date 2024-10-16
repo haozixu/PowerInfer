@@ -44,7 +44,10 @@ void collect_predictor_output(const struct ggml_tensor *, void *swapper);
 // hard-coded for now
 static inline bool is_swap_target_tensor(const char *name) {
     // assert(name != nullptr);
-    return strstr(name, "ffn_gate") || strstr(name, "ffn_up") || strstr(name, "ffn_down") || strstr(name, "ffn_down_t");
+    return strstr(name, "ffn_gate.weight") ||
+        strstr(name, "ffn_up.weight") ||
+        strstr(name, "ffn_down.weight") ||
+        strstr(name, "ffn_down_t.weight");
 }
 
 static inline bool is_swap_target_tensor(const ggml_tensor *x) {

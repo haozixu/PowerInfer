@@ -620,8 +620,9 @@ static std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NAMES = 
             { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
             { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
-            // { LLM_TENSOR_MLP_PRED_FC1,    "blk.%d.fc1" },
-            // { LLM_TENSOR_MLP_PRED_FC2,    "blk.%d.fc2" },
+            { LLM_TENSOR_FFN_DOWN_T,      "blk.%d.ffn_down_t" },
+            { LLM_TENSOR_MLP_PRED_FC1,    "blk.%d.fc1" },
+            { LLM_TENSOR_MLP_PRED_FC2,    "blk.%d.fc2" },
         },
     },
     {
@@ -3319,6 +3320,10 @@ static void llm_load_sparse_model_tensors(
         const int64_t n_layer    = hparams.n_layer;
         const int64_t n_vocab    = hparams.n_vocab;
 
+        auto mark_swappable_tensor = [swapper, &ml](ggml_tensor *x, int layer_idx) {
+            swapper->add_tensor_ordered(x, ml.file_offset(ggml_get_name(x)), layer_idx);
+        };
+
         const auto tn = LLM_TN(model.arch);
         switch (model.arch) {
             case LLM_ARCH_LLAMA:
@@ -3335,10 +3340,6 @@ static void llm_load_sparse_model_tensors(
 
                     const uint32_t n_ff = hparams.n_ff;
                     model.layers.resize(n_layer);
-
-                    auto mark_swappable_tensor = [swapper, &ml](ggml_tensor *x, int layer_idx) {
-                        swapper->add_tensor_ordered(x, ml.file_offset(ggml_get_name(x)), layer_idx);
-                    };
 
                     for (uint32_t &i = current_layer; i < n_layer; ++i) {
                        auto & layer = model.layers[i];
@@ -3359,15 +3360,15 @@ static void llm_load_sparse_model_tensors(
                         // layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
                     
                         if (!swap_on) {
-                            layer.ffn_gate = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, GGML_BACKEND_CPU);
+                            layer.ffn_gate   = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_GATE,   "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
                             layer.ffn_down_t = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN_T, "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
-                            layer.ffn_up   = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, GGML_BACKEND_CPU);
+                            layer.ffn_up     = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,     "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
                         } else {
                             // hzx: use dedicated context for ffn_up & ffn_down
                             // TODO: make this process automated
-                            layer.ffn_gate = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, GGML_BACKEND_CPU);
+                            layer.ffn_gate   = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_GATE,   "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
                             layer.ffn_down_t = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_DOWN_T, "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
-                            layer.ffn_up   = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, GGML_BACKEND_CPU);
+                            layer.ffn_up     = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,   "  weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
 
                             // NOTE: these calls are ordered. swapper is also attached to these tensors
                             mark_swappable_tensor(layer.ffn_gate, i);
@@ -3409,6 +3410,53 @@ static void llm_load_sparse_model_tensors(
                         layer.mlp_pre_w2 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC2, "weight", i), {GGML_NE_WILDCARD, n_ff});
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
                     }
+                } break;
+            case LLM_ARCH_OPT:
+                {
+                    model.tok_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+                    model.pos_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_POS_EMBD, "weight"),   {n_embd, hparams.n_ctx_train + 2}, GGML_BACKEND_CPU);
+
+                    model.output_norm    = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},          GGML_BACKEND_CPU);
+                    model.output_norm_b  = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd},          GGML_BACKEND_CPU);
+                    model.output         = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+
+                    const uint32_t n_ff = hparams.n_ff;
+                    model.layers.resize(n_layer);
+
+                    auto backend = GGML_BACKEND_CPU;
+                    for (uint32_t i = 0; i < n_layer; ++i) {
+                        auto & layer = model.layers[i];
+                        layer.attn_norm     = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_NORM,   "weight", i), {n_embd}, backend);
+                        layer.attn_norm_b   = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_NORM,   "bias",   i), {n_embd}, backend);
+                        layer.wq            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_Q,      "weight", i), {n_embd, n_embd},   backend);
+                        layer.bq            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_Q,      "bias",   i), {n_embd},           backend);
+                        layer.wk            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_K,      "weight", i), {n_embd, n_embd},   backend);
+                        layer.bk            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_K,      "bias",   i), {n_embd},           backend);
+                        layer.wv            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_V,      "weight", i), {n_embd, n_embd},   backend);
+                        layer.bv            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_V,      "bias",   i), {n_embd},           backend);
+                        layer.wo            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_OUT,    "weight", i), {n_embd, n_embd},   backend);
+                        layer.bo            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_OUT,    "bias",   i), {n_embd},           backend);
+                        // layer.ffn_down      = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN,    "weight", i), {n_ff, n_embd}, backend);
+                        layer.ffn_down_b    = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN_T,    "bias",   i), {n_embd},       backend);
+                        // layer.ffn_up        = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff}, backend);
+                        layer.ffn_up_b      = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,      "bias",   i), {n_ff},           backend);
+                        layer.ffn_norm      = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_NORM,    "weight", i), {n_embd}, backend);
+                        layer.ffn_norm_b    = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_NORM,    "bias",   i), {n_embd}, backend);
+
+                        layer.mlp_pre_w1 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC1, "weight", i), {n_embd, GGML_NE_WILDCARD});
+                        layer.mlp_pre_w2 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC2, "weight", i), {GGML_NE_WILDCARD, n_ff});
+
+                        if (!swap_on) {
+                            layer.ffn_up     = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff}, backend);
+                            layer.ffn_down_t = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN_T,  "weight", i), {n_embd, n_ff}, backend);
+                        } else {
+                            layer.ffn_up     = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff}, backend);
+                            layer.ffn_down_t = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_DOWN_T,  "weight", i), {n_embd, n_ff}, backend);
+                        
+                            mark_swappable_tensor(layer.ffn_up, i);
+                            mark_swappable_tensor(layer.ffn_down_t, i);
+                        }
+                    } 
                 } break;
             default:
                 throw std::runtime_error("unknown architecture");
@@ -3613,6 +3661,10 @@ static void llm_load_tensors(
         const int64_t n_layer    = hparams.n_layer;
         const int64_t n_vocab    = hparams.n_vocab;
 
+        auto mark_swappable_tensor = [swapper, &ml](ggml_tensor *x) {
+            swapper->add_tensor_ordered(x, ml.file_offset(ggml_get_name(x)));
+        };
+
         const auto tn = LLM_TN(model.arch);
         switch (model.arch) {
             case LLM_ARCH_LLAMA:
@@ -3657,10 +3709,6 @@ static void llm_load_tensors(
                     const int i_gpu_start = n_layer - n_gpu_layers;
 
                     model.layers.resize(n_layer);
-
-                    auto mark_swappable_tensor = [swapper, &ml](ggml_tensor *x) {
-                        swapper->add_tensor_ordered(x, ml.file_offset(ggml_get_name(x)));
-                    };
 
                     for (uint32_t i = 0; i < n_layer; ++i) {
                         const ggml_backend_type backend = int(i) < i_gpu_start ? GGML_BACKEND_CPU : llama_backend_offload; // NOLINT
@@ -4221,14 +4269,14 @@ static void llm_load_tensors(
                     // TODO(hzx): why position_embd has shape (4096, 2050) for OPTs?
                     model.tok_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
                     model.pos_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_POS_EMBD, "weight"),   {n_embd, hparams.n_ctx_train + 2}, GGML_BACKEND_CPU);
-                    
+
                     model.output_norm    = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},          GGML_BACKEND_CPU);
                     model.output_norm_b  = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd},          GGML_BACKEND_CPU);
                     model.output         = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
 
                     const uint32_t n_ff = hparams.n_ff;
                     model.layers.resize(n_layer);
-                    
+
                     auto backend = GGML_BACKEND_CPU;
                     for (uint32_t i = 0; i < n_layer; ++i) {
                         auto & layer = model.layers[i];
@@ -4242,12 +4290,23 @@ static void llm_load_tensors(
                         layer.bv            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_V,      "bias",   i), {n_embd},           backend);
                         layer.wo            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_OUT,    "weight", i), {n_embd, n_embd},   backend);
                         layer.bo            = ml.create_tensor(ctx, tn(LLM_TENSOR_ATTN_OUT,    "bias",   i), {n_embd},           backend);
-                        layer.ffn_down      = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN,    "weight", i), {n_ff, n_embd}, backend);
+                        // layer.ffn_down      = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN,    "weight", i), {n_ff, n_embd}, backend);
                         layer.ffn_down_b    = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN,    "bias",   i), {n_embd},       backend);
-                        layer.ffn_up        = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff}, backend);
+                        // layer.ffn_up        = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff}, backend);
                         layer.ffn_up_b      = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,      "bias",   i), {n_ff},           backend);
                         layer.ffn_norm      = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_NORM,    "weight", i), {n_embd}, backend);
                         layer.ffn_norm_b    = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_NORM,    "bias",   i), {n_embd}, backend);
+
+                        if (!swap_on) {
+                            layer.ffn_up   = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff}, backend);
+                            layer.ffn_down = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN,    "weight", i), {n_ff, n_embd}, backend);
+                        } else {
+                            layer.ffn_up   = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff}, backend);
+                            layer.ffn_down = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_DOWN,    "weight", i), {n_ff, n_embd}, backend);
+                        
+                            mark_swappable_tensor(layer.ffn_up);
+                            mark_swappable_tensor(layer.ffn_down);
+                        }
                     }
                 } break;
 
@@ -6305,11 +6364,29 @@ struct llm_build_context {
 
             // FF
             {
-                cur = llm_build_ffn(ctx0, cur,
+                if (llama_use_sparse_inference(&model)) {
+                    llm_build_cb_short cbs = [&](ggml_tensor * cur, const char * name) {
+                        std::string name_str = std::string(name) + "-" + std::to_string(il);
+                        ggml_set_name(cur, name_str.c_str());
+                    };
+
+                    cur = llm_build_ffn_sparse(ctx0, cur,
+                        model.layers[il].ffn_up,     model.layers[il].ffn_up_b,
+                        NULL,                        NULL,
+                        model.layers[il].ffn_down_t, model.layers[il].ffn_down_b,
+                        model.layers[il].mlp_pre_w1, model.layers[il].mlp_pre_w2,
+                        // TODO(hzx): revise fields below after real predictors for OPT become available
+                        cur,
+                        model.layers[il].gpu_idx,    model.layers[il].gpu_bucket,
+                        model.layers[il].ffn_gate_gpu, model.layers[il].ffn_down_gpu, model.layers[il].ffn_up_gpu,
+                        LLM_FFN_RELU, LLM_FFN_SEQ, model.layers[il].gpu_offload_ratio, cbs);
+                } else {
+                    cur = llm_build_ffn(ctx0, cur,
                         model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
                         NULL,                      NULL,
                         model.layers[il].ffn_down, model.layers[il].ffn_down_b,
                         LLM_FFN_RELU, LLM_FFN_SEQ, cb, il);
+                }
             }
 
             inpL = ggml_add(ctx0, cur, ffn_inp);
