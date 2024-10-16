@@ -97,11 +97,12 @@ class Model(ABC):
         self._set_vocab_gpt2()
 
     def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
-        for model_layer, part_name in self._get_mlp_part_layer_names():
-            print(f"gguf: loading mlp part '{part_name}'")
-            mlp_model = ReluMLP.from_file(self.dir_mlp_pred / part_name)
-            for name, data in mlp_model.state_dict().items():
-                yield f"blk.{model_layer}.{name}", data
+        if self.dir_mlp_pred:
+            for model_layer, part_name in self._get_mlp_part_layer_names():
+                print(f"gguf: loading mlp part '{part_name}'")
+                mlp_model = ReluMLP.from_file(self.dir_mlp_pred / part_name)
+                for name, data in mlp_model.state_dict().items():
+                    yield f"blk.{model_layer}.{name}", data
 
         for part_name in self.part_names:
             print(f"gguf: loading model part '{part_name}'")
@@ -185,6 +186,8 @@ class Model(ABC):
             return FalconModel
         if model_architecture == "LlamaForCausalLM":
             return LlamaModel
+        if model_architecture == "OPTForCausalLM":
+            return OPTModel
 
         raise NotImplementedError(f'Architecture "{model_architecture}" not supported!')
 
@@ -218,6 +221,8 @@ class Model(ABC):
             return gguf.MODEL_ARCH.FALCON
         if arch == "RWForCausalLM" or arch == "LlamaForCausalLM":
             return gguf.MODEL_ARCH.LLAMA
+        if arch == "OPTForCausalLM":
+            return gguf.MODEL_ARCH.OPT
 
         raise NotImplementedError(f'Architecture "{arch}" not supported!')
 
@@ -335,7 +340,7 @@ class LlamaModel(Model):
     def set_vocab(self):
         self._set_vocab_sentencepiece()
 
-    def set_gguf_parameters(self, params: PredictorParams):
+    def set_gguf_parameters(self, params: PredictorParams | None):
         self.gguf_writer.add_name("Llama")
         self.gguf_writer.add_context_length(2048)  # not in config.json
         self.gguf_writer.add_embedding_length(self.hparams["hidden_size"])
@@ -350,7 +355,7 @@ class LlamaModel(Model):
         self.gguf_writer.add_rope_freq_base(self.hparams["rope_theta"])
         self.gguf_writer.add_file_type(self.ftype)
 
-        if params.sparse_threshold is not None:
+        if params is not None and params.sparse_threshold is not None:
             self.gguf_writer.add_sparse_threshold(params.sparse_threshold)
 
     def write_tensors(self):
@@ -411,7 +416,7 @@ class LlamaModel(Model):
 
 
 class FalconModel(Model):
-    def set_gguf_parameters(self, params: PredictorParams):
+    def set_gguf_parameters(self, params: PredictorParams | None):
         block_count = self.hparams.get("num_hidden_layers")
         if block_count is None:
             block_count = self.hparams["n_layer"]  # old name
@@ -435,7 +440,7 @@ class FalconModel(Model):
         self.gguf_writer.add_layer_norm_eps(self.hparams["layer_norm_epsilon"])
         self.gguf_writer.add_file_type(self.ftype)
 
-        if params.sparse_threshold is not None:
+        if params is not None and params.sparse_threshold is not None:
             self.gguf_writer.add_sparse_threshold(params.sparse_threshold)
 
     def write_tensors(self):
@@ -514,6 +519,73 @@ class FalconModel(Model):
             self.gguf_writer.add_tensor(new_name, data)
 
 
+class OPTModel(Model):
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self, params: PredictorParams | None):
+        self.gguf_writer.add_name("OPT")
+        self.gguf_writer.add_context_length(2048)  # not in config.json
+        self.gguf_writer.add_embedding_length(self.hparams["hidden_size"])
+        self.gguf_writer.add_block_count(self.hparams["num_hidden_layers"])
+        self.gguf_writer.add_feed_forward_length(self.hparams["ffn_dim"])
+        self.gguf_writer.add_head_count(self.hparams["num_attention_heads"])
+        self.gguf_writer.add_head_count_kv(self.hparams["num_attention_heads"])
+        self.gguf_writer.add_layer_norm_eps(1e-5)
+        self.gguf_writer.add_file_type(self.ftype)
+    
+    def write_tensors(self):
+        for name, data_torch in self.get_tensors():
+            old_dtype = data_torch.dtype
+
+            # convert any unsupported data types to float32
+            if data_torch.dtype not in (torch.float16, torch.float32):
+                data_torch = data_torch.to(torch.float32)
+
+            data = data_torch.squeeze().numpy()
+
+            # map tensor names
+            new_name = self._translate_tensor_key(name)
+            if new_name is None:
+                print(f"Can not map tensor {name!r}")
+                sys.exit()
+
+            if self.dir_mlp_pred:
+                # We need to transpose the weight matrices for the FFN Down layers to support the
+                # Axpy operation in PowerInfer. So we don't need to transpose them at runtime.
+                if "ffn_down" in new_name:
+                    new_name = new_name.replace("ffn_down", "ffn_down_t")
+                    data = data.T
+
+            n_dims = len(data.shape)
+            data_dtype = data.dtype
+
+            # if f32 desired, convert any float16 to float32
+            if self.ftype == 0 and data_dtype == np.float16:
+                data = data.astype(np.float32)
+
+            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
+            # NOTE(hzx): keep bias and layernorm weights as float32
+            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
+                data = data.astype(np.float32)
+
+            # if f16 desired, convert any float32 2-dim weight tensors to float16
+            if (
+                self.ftype == 1
+                and data_dtype == np.float32
+                and name.endswith(".weight")
+                and n_dims == 2
+            ):
+                data = data.astype(np.float16)
+            
+            # NOTE(hzx): make token_embed, position_embed and lm_head fp32
+            if 'token_embd' in new_name or 'position_embd' in new_name or 'output.weight' == new_name:
+                data = data.astype(np.float32)
+
+            print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
+
+            self.gguf_writer.add_tensor(new_name, data)
+
 
 @dataclass
 class PredictorParams:
@@ -572,7 +644,7 @@ def parse_args() -> argparse.Namespace:
         help="directory containing model file",
     )
     parser.add_argument(
-        "mlp_predictors",
+        "--mlp_predictors",
         type=Path,
         help="directory containing MLP predictors for model",
     )
@@ -587,9 +659,9 @@ dir_mlp_pred = args.mlp_predictors
 if not dir_model.is_dir():
     print(f"Error: {args.model} is not a directory", file=sys.stderr)
     sys.exit(1)
-if not dir_mlp_pred.is_dir():
-    print(f"Error: {args.mlp_predictors} is not a directory", file=sys.stderr)
-    sys.exit(1)
+# if not dir_mlp_pred.is_dir():
+#     print(f"Error: {args.mlp_predictors} is not a directory", file=sys.stderr)
+#     sys.exit(1)
 
 ftype_map = {
     "f32": gguf.GGMLQuantizationType.F32,
@@ -612,7 +684,7 @@ model_instance = model_class(
 )
 
 print("Set model parameters")
-params = PredictorParams.load(model_instance)
+params = PredictorParams.load(model_instance) if dir_mlp_pred else None
 model_instance.set_gguf_parameters(params)
 
 print("Set model tokenizer")
@@ -625,9 +697,10 @@ else:
     print(f"Exporting model to '{fname_out}'")
     model_instance.write()
 
-# post-process: write another unique file header to distinguish from the origianl GGUF file
-with open(fname_out, "r+b") as fout:
-    POWERINFER_MAGIC = int.from_bytes(b"PWRI", "little")
-    fout.write(struct.pack("<I", POWERINFER_MAGIC))
+if dir_mlp_pred:
+    # post-process: write another unique file header to distinguish from the origianl GGUF file
+    with open(fname_out, "r+b") as fout:
+        POWERINFER_MAGIC = int.from_bytes(b"PWRI", "little")
+        fout.write(struct.pack("<I", POWERINFER_MAGIC))
 
 print(f"Model successfully exported to '{fname_out}'")
