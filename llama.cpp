@@ -3247,10 +3247,20 @@ static void llm_load_sparse_model_tensors(
             LLAMA_LOG_INFO("swapper: env var LLAMA_SWAP_SIZE_MB not set or invalid. using default size %.2f MiB (swap off)\n"
                 , ctx_swap_max_size / 1048576.0);
         }
+
+        auto sparsity_ratio_env_var = getenv("PRED_SPARSITY_RATIO");
+        float forced_sparsity_ratio = 0.0;
+        if (sparsity_ratio_env_var) {
+            try {
+                forced_sparsity_ratio = std::atof(sparsity_ratio_env_var);
+                LLAMA_LOG_INFO("swapper: predictor sparsity ratio is set to fixed value %g\n", forced_sparsity_ratio);
+            } catch (...) {}
+        }
     
         size_t swap_area_size = swap_size_ok ? swap_size_mb * 1048576 : ctx_swap_max_size;
         swapper = new Swapper;
-        swapper->init(swap_area_size, fileno(ml.file.fp), true);
+        swapper->init(swap_area_size, fileno(ml.file.fp),
+            true, forced_sparsity_ratio, hparams.n_embd);
     }
 
     // create the ggml context

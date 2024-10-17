@@ -534,6 +534,21 @@ class OPTModel(Model):
         self.gguf_writer.add_layer_norm_eps(1e-5)
         self.gguf_writer.add_file_type(self.ftype)
     
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        if self.dir_mlp_pred:
+            for model_layer, part_name in self._get_mlp_part_layer_names():
+                print(f"gguf: loading mlp part '{part_name}'")
+                mlp_model = ReluMLP.from_file(self.dir_mlp_pred / part_name)
+                for name, data in mlp_model.state_dict().items():
+                    yield f"blk.{model_layer}.{name}", data
+        
+        from transformers import AutoModelForCausalLM
+        m = AutoModelForCausalLM.from_pretrained(self.dir_model)
+
+        with torch.no_grad():
+            for name, data in m.state_dict().items():
+                yield name, data
+    
     def write_tensors(self):
         for name, data_torch in self.get_tensors():
             old_dtype = data_torch.dtype
@@ -548,7 +563,8 @@ class OPTModel(Model):
             new_name = self._translate_tensor_key(name)
             if new_name is None:
                 print(f"Can not map tensor {name!r}")
-                sys.exit()
+                continue
+                # sys.exit()
 
             if self.dir_mlp_pred:
                 # We need to transpose the weight matrices for the FFN Down layers to support the

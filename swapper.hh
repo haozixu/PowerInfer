@@ -84,6 +84,8 @@ struct Swapper {
     int file_fd; // descriptor of the weights file, only support single file
     bool defer_load;
     bool is_sparse_mode;
+    float forced_sparsity_ratio; // maybe we should use std::optional
+    int n_embd; // hidden size of the model, only used to compute load block size in sparse mode
 
     size_t buf_size; // total size of swappable area
     uint8_t *buffer;
@@ -102,11 +104,12 @@ struct Swapper {
     // sparse mode bookkeeping
     std::unordered_map<int, std::vector<int>> active_indices; // layer idx => active sparse indices made by predictor 
 
-    Swapper() : magic{SWAPPER_MAGIC}, file_fd{-1}, defer_load{false}, is_sparse_mode{false},
+    Swapper() : magic{SWAPPER_MAGIC}, file_fd{-1},
+        defer_load{false}, is_sparse_mode{false}, forced_sparsity_ratio{0}, n_embd{0},
         buf_size{0}, buffer{nullptr},
         next_load_idx{-1}, next_buf_pos(0) {}
     
-    void init(size_t size, int fd, bool sparse_mode = false) {
+    void init(size_t size, int fd, bool sparse_mode = false, float sparsity_ratio = 0.0f, int hidden_dim = 0x40000000) {
         buf_size = size;
         file_fd = dup(fd); // duplicate incoming fd here for longer life-time
         // file_fd = open("/dev/block/dm-23", O_RDONLY | O_DIRECT);
@@ -114,6 +117,8 @@ struct Swapper {
 
         defer_load = getenv("LLAMA_SWAP_DEFER_LOAD") != nullptr; // if env var is non-NULL, defer async weight load
         is_sparse_mode = sparse_mode;
+        forced_sparsity_ratio = sparsity_ratio;
+        n_embd = hidden_dim;
 
         int ret = posix_memalign((void **) &buffer, MY_PAGE_SIZE, size);
         GGML_ASSERT(!ret);
@@ -201,14 +206,16 @@ struct Swapper {
     }
 
     void issue_load(ggml_tensor *x, uint8_t *dst) {
-        auto len = ggml_nbytes(x);
-        auto off = info[x].file_offset;
-        int layer_idx = info[x].layer_idx;
-        int fd = file_fd;
-
         // TODO: direct file read
         auto launch_policy = defer_load ? std::launch::deferred : std::launch::async;
-        pending_reqs[x] = std::async(launch_policy, [fd, dst, len, off, this, x, layer_idx]() -> void * {
+        pending_reqs[x] = std::async(launch_policy, [this, x, dst]() -> void * {
+            // NOTE: these immutable field accesses can be moved out of the lambda
+            int fd = this->file_fd;
+            const auto &info = this->info.find(x)->second; // assume hit
+            int layer_idx = info.layer_idx;
+            size_t off = info.file_offset;
+            size_t len = ggml_nbytes(x);
+            
             bool partial_read = false;
             std::vector<int> indices;
             if (this->is_sparse_mode) {
@@ -230,7 +237,7 @@ struct Swapper {
                 }
             } else {
                 // TODO: ensure weight memory layout
-                size_t row_size = 4096 * ggml_type_size(x->type)/ggml_blck_size(x->type);
+                size_t row_size = this->n_embd * ggml_type_size(x->type)/ggml_blck_size(x->type);
 
                 for (int i : indices) {
                     GGML_ASSERT(0 <= i && i < x->ne[1]);
@@ -304,10 +311,9 @@ struct Swapper {
         std::vector<int> indices;
         float *data = (float *) pred_out->data;
         
-        if (true) {
+        if (0 < forced_sparsity_ratio && forced_sparsity_ratio < 1) {
             // fixed sparsity ratio
-            const float SPARSITY_RATIO = 0.15;
-            int nr_active_neurons = int(nr_neurons * SPARSITY_RATIO);
+            int nr_active_neurons = int(nr_neurons * forced_sparsity_ratio);
 
             // only keep indices that correspond to top-k activation values
             for (int i = 0; i < nr_neurons; ++i)
@@ -319,6 +325,7 @@ struct Swapper {
             indices.resize(nr_active_neurons);
             std::sort(indices.begin(), indices.end());
         } else {
+            // RELU-style activation
             for (int i = 0; i < nr_neurons; ++i)
                 if (data[i] > 0.0)
                     indices.push_back(i);
