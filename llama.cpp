@@ -3378,7 +3378,7 @@ static void llm_load_sparse_model_tensors(
                             // TODO: make this process automated
                             layer.ffn_gate   = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_GATE,   "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
                             layer.ffn_down_t = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_DOWN_T, "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
-                            layer.ffn_up     = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,   "  weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
+                            layer.ffn_up     = ml.create_tensor(ctx_swap, tn(LLM_TENSOR_FFN_UP,     "weight", i), {n_embd, n_ff}, GGML_BACKEND_CPU);
 
                             // NOTE: these calls are ordered. swapper is also attached to these tensors
                             mark_swappable_tensor(layer.ffn_gate, i);
@@ -7179,6 +7179,8 @@ static int llama_decode_internal(
     if (n_tokens == 1) {
         lctx.t_eval_us += ggml_time_us() - t_start_us;
         lctx.n_eval++;
+
+        lctx.t_swap_load_us += gf->swap_load_time_us;
     }
     else if (n_tokens > 1) {
         lctx.t_p_eval_us += ggml_time_us() - t_start_us;
@@ -7192,7 +7194,7 @@ static int llama_decode_internal(
         lctx.has_evaluated_once = true;
     }
 
-    lctx.t_swap_load_us += gf->swap_load_time_us;
+    // lctx.t_swap_load_us += gf->swap_load_time_us;
     return 0;
 }
 
@@ -11044,7 +11046,7 @@ void llama_print_timings(struct llama_context * ctx) {
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, timings.t_eval_ms, timings.n_eval, timings.t_eval_ms / timings.n_eval, 1e3 / timings.t_eval_ms * timings.n_eval);
     LLAMA_LOG_INFO("%s:   swap load time = %10.2f ms / %5d runs   (%8.2f ms per token)\n",
-            __func__, timings.t_swap_load_ms, timings.n_sample, timings.t_swap_load_ms / timings.n_sample);
+            __func__, timings.t_swap_load_ms, timings.n_eval, timings.t_swap_load_ms / timings.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms\n", __func__, (timings.t_end_ms - timings.t_start_ms));
 }
 
