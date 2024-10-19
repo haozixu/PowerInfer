@@ -213,6 +213,14 @@ class TensorNameMap:
         MODEL_TENSOR.FC_2: (
             "model.layers.{bid}.fc2",
         ),
+
+        MODEL_TENSOR.PROJECT_IN: {
+            "model.decoder.project_in",
+        },
+
+        MODEL_TENSOR.PROJECT_OUT: {
+            "model.decoder.project_out",
+        },
     }
 
     mapping: dict[str, tuple[MODEL_TENSOR, str]]

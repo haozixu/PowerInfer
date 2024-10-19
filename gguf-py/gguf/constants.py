@@ -126,6 +126,8 @@ class MODEL_TENSOR(IntEnum):
     FFN_DOWN_T      = auto()
     FC_1            = auto()
     FC_2            = auto()
+    PROJECT_IN      = auto() # opt-350m only
+    PROJECT_OUT     = auto() # opt-350m only
 
 
 
@@ -172,6 +174,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_DOWN_T:      "blk.{bid}.ffn_down_t",
     MODEL_TENSOR.FC_1:            "blk.{bid}.fc1",
     MODEL_TENSOR.FC_2:            "blk.{bid}.fc2",
+    MODEL_TENSOR.PROJECT_IN:      "project_in", # opt-350m only
+    MODEL_TENSOR.PROJECT_OUT:     "project_out", # opt-350m only
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -371,6 +375,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.PROJECT_IN, # opt-350m only
+        MODEL_TENSOR.PROJECT_OUT, # opt-350m only
         # sparse mode only
         MODEL_TENSOR.FFN_DOWN_T,
         MODEL_TENSOR.FC_1,

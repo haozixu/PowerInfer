@@ -400,6 +400,8 @@ enum llm_tensor {
     LLM_TENSOR_MLP_PRED_FC1,
     LLM_TENSOR_MLP_PRED_FC2,
     LLM_TENSOR_FFN_DOWN_T,
+    LLM_TENSOR_PROJECT_IN, // OPT-350m only
+    LLM_TENSOR_PROJECT_OUT, // OPT-350m only
 };
 
 static std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NAMES = {
@@ -623,6 +625,8 @@ static std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NAMES = 
             { LLM_TENSOR_FFN_DOWN_T,      "blk.%d.ffn_down_t" },
             { LLM_TENSOR_MLP_PRED_FC1,    "blk.%d.fc1" },
             { LLM_TENSOR_MLP_PRED_FC2,    "blk.%d.fc2" },
+            { LLM_TENSOR_PROJECT_IN,      "project_in" },
+            { LLM_TENSOR_PROJECT_OUT,     "project_out" },
         },
     },
     {
@@ -1498,6 +1502,8 @@ struct llama_model {
     struct ggml_tensor * output_norm;
     struct ggml_tensor * output_norm_b;
     struct ggml_tensor * output;
+
+    struct ggml_tensor * project_in, * project_out; // for OPT-350m only
 
     std::vector<llama_layer> layers;
 
@@ -3423,12 +3429,24 @@ static void llm_load_sparse_model_tensors(
                 } break;
             case LLM_ARCH_OPT:
                 {
-                    model.tok_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
-                    model.pos_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_POS_EMBD, "weight"),   {n_embd, hparams.n_ctx_train + 2}, GGML_BACKEND_CPU);
+                    bool is_350m = (n_embd == 1024) && (n_layer == 24);
+                    if (is_350m) {
+                        model.tok_embd    = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {512, n_vocab}, GGML_BACKEND_CPU);
+                        model.project_in  = ml.create_tensor(ctx, tn(LLM_TENSOR_PROJECT_IN,  "weight"), {512, n_embd}, GGML_BACKEND_CPU);
 
-                    model.output_norm    = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},          GGML_BACKEND_CPU);
-                    model.output_norm_b  = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd},          GGML_BACKEND_CPU);
-                    model.output         = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+                        model.project_out = ml.create_tensor(ctx, tn(LLM_TENSOR_PROJECT_OUT, "weight"), {n_embd, 512}, GGML_BACKEND_CPU);
+                        model.output      = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {512, n_vocab}, GGML_BACKEND_CPU);
+                    
+                        model.output_norm = model.output_norm_b = nullptr;
+                    } else {
+                        model.tok_embd       = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+                        model.output_norm    = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},          GGML_BACKEND_CPU);
+                        model.output_norm_b  = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd},          GGML_BACKEND_CPU);
+                        model.output         = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+                    
+                        model.project_in = model.project_out = nullptr;
+                    }
+                    model.pos_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_POS_EMBD, "weight"),   {n_embd, hparams.n_ctx_train + 2}, GGML_BACKEND_CPU);
 
                     const uint32_t n_ff = hparams.n_ff;
                     model.layers.resize(n_layer);
@@ -4276,13 +4294,24 @@ static void llm_load_tensors(
                 } break;
             case LLM_ARCH_OPT:
                 {
-                    // TODO(hzx): why position_embd has shape (4096, 2050) for OPTs?
-                    model.tok_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
-                    model.pos_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_POS_EMBD, "weight"),   {n_embd, hparams.n_ctx_train + 2}, GGML_BACKEND_CPU);
+                    bool is_350m = (n_embd == 1024) && (n_layer == 24);
+                    if (is_350m) {
+                        model.tok_embd    = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {512, n_vocab}, GGML_BACKEND_CPU);
+                        model.project_in  = ml.create_tensor(ctx, tn(LLM_TENSOR_PROJECT_IN,  "weight"), {512, n_embd}, GGML_BACKEND_CPU);
 
-                    model.output_norm    = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},          GGML_BACKEND_CPU);
-                    model.output_norm_b  = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd},          GGML_BACKEND_CPU);
-                    model.output         = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+                        model.project_out = ml.create_tensor(ctx, tn(LLM_TENSOR_PROJECT_OUT, "weight"), {n_embd, 512}, GGML_BACKEND_CPU);
+                        model.output      = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {512, n_vocab}, GGML_BACKEND_CPU);
+                    
+                        model.output_norm = model.output_norm_b = nullptr;
+                    } else {
+                        model.tok_embd       = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+                        model.output_norm    = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd},          GGML_BACKEND_CPU);
+                        model.output_norm_b  = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd},          GGML_BACKEND_CPU);
+                        model.output         = ml.create_tensor(ctx, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
+                    
+                        model.project_in = model.project_out = nullptr;
+                    }
+                    model.pos_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_POS_EMBD, "weight"),   {n_embd, hparams.n_ctx_train + 2}, GGML_BACKEND_CPU);
 
                     const uint32_t n_ff = hparams.n_ff;
                     model.layers.resize(n_layer);
@@ -6290,6 +6319,8 @@ struct llm_build_context {
     }
 
     struct ggml_cgraph * build_opt() {
+        bool is_350m = (model.hparams.n_embd == 1024) && (model.hparams.n_layer == 24);
+
         struct ggml_cgraph *gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
 
         struct ggml_tensor * cur;
@@ -6320,6 +6351,11 @@ struct llm_build_context {
         hidden_states = inputs_embeds + pos_embeds
         */
 
+        if (model.project_in) {
+            inpL = ggml_mul_mat(ctx0, model.project_in, inpL);
+            cb(inpL, "proj_in", -1);
+        }
+
         pos = ggml_get_rows(ctx0, model.pos_embd, inp_pos);
         cb(pos, "pos_embd", -1);
 
@@ -6328,11 +6364,15 @@ struct llm_build_context {
 
         for (int il = 0; il < n_layer; ++il) {
             // 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-            cur = llm_build_norm(ctx0, inpL, hparams,
+            if (!is_350m) {
+                cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm,
                     model.layers[il].attn_norm_b,
                     LLM_NORM, cb, il);
-            cb(cur, "attn_norm", il);
+                cb(cur, "attn_norm", il);
+            } else {
+                cur = inpL;
+            }
         
             // self-attention
             {
@@ -6363,14 +6403,24 @@ struct llm_build_context {
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
             cb(ffn_inp, "ffn_inp", il);
 
-            // TODO: 350m applies layer norm AFTER attention
+            // 350m applies layer norm AFTER attention
+            if (is_350m) {
+                ffn_inp = llm_build_norm(ctx0, ffn_inp, hparams,
+                    model.layers[il].attn_norm, model.layers[il].attn_norm_b,
+                    LLM_NORM, cb, il);
+                cb(ffn_inp, "attn_norm", il);
+            }
 
             // 125m, 1.7B, ..., 175B applies layer norm BEFORE ffn
-            cur = llm_build_norm(ctx0, ffn_inp, hparams,
+            if (!is_350m) {
+                cur = llm_build_norm(ctx0, ffn_inp, hparams,
                     model.layers[il].ffn_norm,
                     model.layers[il].ffn_norm_b,
                     LLM_NORM, cb, il);
-            cb(cur, "ffn_norm", il);
+                cb(cur, "ffn_norm", il);
+            } else {
+                cur = ffn_inp;
+            }
 
             // FF
             {
@@ -6402,7 +6452,13 @@ struct llm_build_context {
             inpL = ggml_add(ctx0, cur, ffn_inp);
             cb(inpL, "l_out", il);
 
-            // TODO: 350m applies layer norm AFTER ffn
+            // 350m applies layer norm AFTER ffn
+            if (is_350m) {
+                inpL = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].ffn_norm, model.layers[il].ffn_norm_b,
+                    LLM_NORM, cb, il);
+                cb(inpL, "ffn_norm", il);
+            }
         }
 
         /*
@@ -6414,11 +6470,19 @@ struct llm_build_context {
         */
 
         cur = inpL;
-        cur = llm_build_norm(ctx0, cur, hparams,
+
+        if (model.output_norm) {
+            cur = llm_build_norm(ctx0, cur, hparams,
                 model.output_norm,
                 model.output_norm_b,
                 LLM_NORM, cb, -1);
-        cb(cur, "result_norm", -1);
+            cb(cur, "result_norm", -1);
+        }
+
+        if (model.project_out) {
+            cur = ggml_mul_mat(ctx0, model.project_out, cur);
+            cb(cur, "proj_out", -1);
+        }
 
         cur = ggml_mul_mat(ctx0, model.output, cur);
         cb(cur, "result_output", -1);
@@ -7043,7 +7107,7 @@ static int llama_decode_internal(
     struct ggml_tensor * embeddings = gf->nodes[gf->n_nodes - 2];
 
     GGML_ASSERT(strcmp(res->name,        "result_output") == 0);
-    GGML_ASSERT(strcmp(embeddings->name, "result_norm")   == 0);
+    // GGML_ASSERT(strcmp(embeddings->name, "result_norm")   == 0);
 
 
 #ifdef GGML_USE_CUBLAS
